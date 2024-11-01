@@ -1,0 +1,230 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  experiment-step-functions
+Resources:
+  SfnToDataExtractFunctionConnector:
+    Type: AWS::Serverless::Connector
+    Properties:
+      Source:
+        Id: DataExtractStateMachine
+      Destination:
+        Id: DataExtractFunction
+      Permissions:
+      - Write
+
+  SfnToStatusTableConnector:
+    Type: AWS::Serverless::Connector
+    Properties:
+      Source:
+        Id: DataExtractStateMachine
+      Destination:
+        Id: StatusTable
+      Permissions:
+      - Write
+  
+  SfnToQueueConnector:
+    Type: AWS::Serverless::Connector
+    Properties:
+      Source:
+        Id: DataExtractStateMachine
+      Destination:
+        Id: Queue
+      Permissions:
+      - Write
+  
+  AnalyzeRecordFunctionToQueueConnector:
+    Type: AWS::Serverless::Connector
+    Properties:
+      Source:
+        Id: AnalyzeRecordFunction
+      Destination:
+        Id: Queue
+      Permissions:
+      - Read
+  
+  SfnToResultsBucketConnector:
+    Type: AWS::Serverless::Connector
+    Properties:
+      Source:
+        Id: DataExtractStateMachine
+      Destination:
+        Id: ResultsBucket
+      Permissions:
+      - Write
+  
+  SfnToBucketRead:
+    Type: AWS::Serverless::Connector
+    Properties:
+      Source:
+        Id: DataExtractStateMachine
+      Destination:
+        Id: Bucket
+      Permissions:
+      - Read
+  
+  DataExtractFunctionToBucketWrite:
+    Type: AWS::Serverless::Connector
+    Properties:
+      Source:
+        Id: DataExtractFunction
+      Destination:
+        Id: Bucket
+      Permissions:
+      - Write
+  
+  Bucket:
+    Type: AWS::S3::Bucket
+  
+  ResultsBucket:
+    Type: AWS::S3::Bucket
+  
+  Dlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: "step-functions-demo-dlq"
+  
+  Queue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: "step-functions-demo"
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt Dlq.Arn
+        maxReceiveCount: 5
+
+  DataExtractStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: "step-functions-demo"
+      DefinitionUri: statemachine/sfn-demo.asl.json
+      DefinitionSubstitutions:
+        DataExtractFunctionName: !GetAtt DataExtractFunction.Arn
+        QueueUrl: !GetAtt Queue.QueueUrl
+        DynamoDbTableName: !Ref StatusTable
+        ResultsBucketArn: !Ref ResultsBucket
+      Events:
+        HourlySchedule:
+          Type: Schedule
+          Properties:
+            Description: Schedule to run the db export state machine every hour
+            Schedule: rate(1 hour)
+            Enabled: false
+      Logging:
+        Level: ALL
+        IncludeExecutionData: true
+        Destinations:
+        - CloudWatchLogsLogGroup:
+            LogGroupArn: !GetAtt SfnLogGroup.Arn
+      Policies:
+      - CloudWatchPutMetricPolicy: {}
+      - Statement:
+        - Effect: Allow
+          Action:
+          - "states:StartExecution"
+          Resource:
+          - !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:step-functions-demo"
+      - Statement:
+        - Effect: Allow
+          Action:
+          - "states:DescribeExecution"
+          - "states:StopExecution"
+          Resource:
+          - !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:step-functions-demo:*"
+      - Statement:
+        - Effect: Allow
+          Action:
+            - "logs:CreateLogDelivery"
+            - "logs:CreateLogStream"
+            - "logs:PutLogEvents"
+            - "logs:PutResourcePolicy"
+            - "logs:GetLogDelivery"
+            - "logs:UpdateLogDelivery"
+            - "logs:DeleteLogDelivery"
+            - "logs:ListLogDeliveries"
+            - "logs:DescribeResourcePolicies"
+            - "logs:DescribeLogGroups"
+          Resource: '*'
+  
+  SfnLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/stepfunctions/DataExtractStateMachine
+      RetentionInDays: 30
+  
+  DataExtractFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/data-extract/
+      Handler: app.lambdaHandler
+      Runtime: nodejs18.x
+      Architectures:
+      - x86_64
+      Environment:
+        Variables:
+          POWERTOOLS_SERVICE_NAME: dataExtract
+          POWERTOOLS_METRICS_NAMESPACE: step-functions-demo
+          POWERTOOLS_LOG_LEVEL: INFO
+          S3_BUCKET_NAME: !Ref Bucket
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2020
+        # Sourcemap: true # Enabling source maps will create the required NODE_OPTIONS environment variables on your lambda function during sam build
+        EntryPoints:
+        - app.ts
+
+  AnalyzeRecordFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/analyze-record/
+      Handler: app.lambdaHandler
+      Runtime: nodejs18.x
+      Architectures:
+      - x86_64
+      Environment:
+        Variables:
+          POWERTOOLS_SERVICE_NAME: analyzeRecord
+          POWERTOOLS_METRICS_NAMESPACE: step-functions-demo
+          POWERTOOLS_LOG_LEVEL: INFO
+      Policies:
+      - Statement:
+        - Effect: Allow
+          Action:
+            - "states:SendTaskFailure"
+            - "states:SendTaskHeartbeat"
+            - "states:SendTaskSuccess"
+          Resource: '*'
+      Timeout: 30
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt Queue.Arn
+            BatchSize: 10
+            Enabled: true
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2020
+        # Sourcemap: true # Enabling source maps will create the required NODE_OPTIONS environment variables on your lambda function during sam build
+        EntryPoints:
+        - app.ts
+
+  StatusTable:
+    Type: AWS::Serverless::SimpleTable
+    Properties:
+      PrimaryKey:
+        Name: Id
+        Type: String
+      ProvisionedThroughput:
+        ReadCapacityUnits: 1
+        WriteCapacityUnits: 1
+
+Globals:
+  Function:
+    LoggingConfig:
+      LogFormat: JSON

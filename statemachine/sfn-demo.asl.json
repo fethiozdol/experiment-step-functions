@@ -1,0 +1,125 @@
+{
+    "Comment": "Personal Experiment with Step Functions",
+    "StartAt": "Data Extract",
+    "States": {
+        "Data Extract": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:lambda:invoke",
+            "Parameters": {
+                "FunctionName": "${DataExtractFunctionName}",
+                "Payload": {
+                    "scheduledEventTime.$": "$$.Execution.StartTime"
+                }
+            },
+            "OutputPath": "$.Payload",
+            "ResultSelector": {
+                "Payload.$":"States.StringToJson($.Payload)"
+            },
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.ServiceException",
+                        "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 2,
+                    "MaxAttempts": 3,
+                    "BackoffRate": 2
+                }
+            ],
+            "Next": "Insert Tracker as In Progress"
+        },
+        "Insert Tracker as In Progress": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::dynamodb:putItem",
+            "Parameters": {
+                "TableName": "${DynamoDbTableName}",
+                "Item": {
+                    "Id": { "S.$": "$.dateTime"},
+                    "Status": { "S": "IN PROGRESS" }
+                }
+            },
+            "Next": "Data Extract Analysis",
+            "ResultPath": null
+        },
+        "Data Extract Analysis": {
+            "Type": "Map",
+            "ItemProcessor": {
+                "ProcessorConfig": {
+                    "Mode": "DISTRIBUTED",
+                    "ExecutionType": "STANDARD"
+                },
+                "StartAt": "Analyze Record",
+                "States": {
+                    "Analyze Record": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::sqs:sendMessage.waitForTaskToken",
+                        "Parameters": {
+                            "QueueUrl": "${QueueUrl}",
+                            "MessageBody": {
+                                "items.$": "$",
+                                "taskToken.$": "$$.Task.Token"
+                            }
+                        },
+                        "Next": "Notify Success",
+                        "Catch": [
+                            {
+                                "ErrorEquals": [ "States.ALL" ],
+                                "Next": "Notify Failure"
+                              }
+                        ]
+                    },
+                    "Notify Success": {
+                        "Type": "Pass",
+                        "End": true
+                    },
+                    "Notify Failure": {
+                        "Type": "Fail"
+                    }
+                }
+            },
+            "ItemReader": {
+                "Resource": "arn:aws:states:::s3:getObject",
+                "ReaderConfig": {
+                    "InputType": "JSON"
+                },
+                "Parameters": {
+                    "Bucket.$": "$.s3.bucketName",
+                    "Key.$": "$.s3.bucketKey"
+                }
+            },
+            "MaxConcurrency": 10,
+            "ItemBatcher": {
+                "MaxItemsPerBatch": 1
+            },
+            "Next": "Update Tracker to DONE",
+            "ResultWriter": {
+                "Resource": "arn:aws:states:::s3:putObject",
+                "Parameters": {
+                    "Bucket": "${ResultsBucketArn}",
+                    "Prefix": "results"
+                }
+            },
+            "ResultPath": null
+        },
+        "Update Tracker to DONE": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::dynamodb:updateItem",
+            "Parameters": {
+                "TableName": "${DynamoDbTableName}",
+                "Key": {
+                    "Id": { "S.$": "$.dateTime"}
+                },
+                "UpdateExpression": "SET #Status = :Status",
+                "ExpressionAttributeNames": {
+                    "#Status": "Status"
+                },
+                "ExpressionAttributeValues": {
+                    ":Status": { "S": "DONE" }
+                }
+            },
+            "End": true
+        }
+    }
+}
